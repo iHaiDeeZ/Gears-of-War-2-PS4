@@ -1,0 +1,16 @@
+# Only what the build needs is in the repository (an allow-list). Your disc image and game files, the packages you
+# build (out/: a full package holds your game), logs, clips, the decompilation's output (decomp/: names and offsets
+# read from your default.xex), private notes and your own pictures (sce_sys/local/, art/) stay out.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/CREDITS.md
+!/LICENSE
+!/docs/
+!/patches/
+!/scripts/
+!/sce_sys/
+!/tools/
+/sce_sys/local/
+__pycache__/

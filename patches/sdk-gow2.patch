@@ -1,0 +1,1090 @@
+diff --git a/include/rex/graphics/cp_perf.h b/include/rex/graphics/cp_perf.h
+index a2730e5..716b32b 100644
+--- a/include/rex/graphics/cp_perf.h
++++ b/include/rex/graphics/cp_perf.h
+@@ -78,6 +78,11 @@ inline std::atomic<uint64_t> vblanks{0};        // vig8-ps4: guest vblank interr
+ inline std::atomic<uint64_t> shader_load_hits{0};        // vig8-ps4 (v00.08): IM_LOADs from the address cache
+ inline std::atomic<uint64_t> rt_updates_skipped{0};      // vig8-ps4 (v00.08): gpu_rt_update_skip
+ inline std::atomic<uint64_t> texture_sets_last_hits{0};  // vig8-ps4 (v00.08): the stage's last set, no hash
++// gow2-ps4 (v00.02): draws left out while their pipeline was being created (vulkan_pipeline_skip_pending), the frames
++// not presented because too many of their draws were (vulkan_pipeline_hold_share), and the largest creation queue.
++inline std::atomic<uint64_t> pipeline_pending_draws{0};
++inline std::atomic<uint64_t> frames_held_for_pipelines{0};
++inline std::atomic<uint64_t> pipeline_queue_peak{0};
+ inline std::atomic<uint64_t> vblanks_early{0};  // vig8-ps4: of them, brought forward to a command processor wait
+ // vig8-ps4 (v00.09): occlusion query events and visibility queries (both reported visible), conditional draws (all
+ // drawn), the draws that found the state of the draw before them with the same shaders (only shader constants
+@@ -87,6 +92,10 @@ inline std::atomic<uint64_t> viz_queries{0};
+ inline std::atomic<uint64_t> conditional_draws{0};
+ inline std::atomic<uint64_t> draws_same_state{0};
+ inline std::atomic<uint64_t> draws_same_but_fetch{0};
++// gow2-ps4 (v00.07): the repeat-draw shortcut (vulkan_repeat_draw_shortcut) - draws that took the draw before's shader
++// variants, pipeline and viewport, and of those the ones that also kept its samplers and texture descriptor sets.
++inline std::atomic<uint64_t> repeat_draws{0};
++inline std::atomic<uint64_t> repeat_texture_draws{0};
+ inline std::atomic<uint64_t> sampler_memo_hits{0};
+ inline std::atomic<uint64_t> sampler_lookups{0};
+ // vig8-ps4 (v00.10): predicated tiling - screen extent events (EVENT_WRITE_EXT, one after each draw while a game tiles)
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index 14522e3..71b3bb0 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -64,6 +64,10 @@ class TextureCache {
+   // mp3-ps4 (v00.21): how many times textures have been destroyed (their image views with them), so a cache
+   // of descriptor sets keyed by image view handles knows when a handle may have been reused.
+   uint64_t texture_destructions() const { return texture_destructions_; }
++  // gow2-ps4 (v00.07): changes whenever what a draw's texture descriptors would hold may have changed - a binding
++  // changed or was reset, a texture was (re)loaded, or a texture became outdated - so the command processor's
++  // repeat-draw shortcut keeps the draw before's texture sets only while it stays the same.
++  uint64_t bindings_generation() const { return bindings_generation_; }
+ 
+   // Hard limit, originating from the half-pixel offset filling hack in the
+   // resolve shaders only filling up to 3 pixels, due to the bit counts used for
+@@ -628,6 +632,7 @@ class TextureCache {
+   // constants have been changed.
+   std::atomic<bool> texture_became_outdated_{false};
+   uint64_t texture_destructions_ = 0;  // mp3-ps4 (v00.21): texture_destructions()
++  uint64_t bindings_generation_ = 0;   // gow2-ps4 (v00.07): bindings_generation()
+   // mp3-ps4 (v00.26): RequestTextures' lists, kept between calls (it allocated them at every draw).
+   std::vector<PendingTextureLoad> request_pending_texture_loads_;
+   std::vector<PendingSharedMemoryRange> request_pending_shared_memory_ranges_;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 55ec41f..d7d4f79 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -505,7 +505,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+       bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
+       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
+       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
+-  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
++  // keep_texture_sets (gow2-ps4 v00.07, the repeat-draw shortcut): the texture descriptor sets of the draw before are
++  // still right for this one (same shaders and samplers, no fetch constant written, same submission, the texture
++  // cache's bindings unchanged) - its texture and sampler part is skipped.
++  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
++                      bool keep_texture_sets = false);
+   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
+   // structure instances (for images and samplers).
+   // The descriptor set layout must be the one for the given is_vertex,
+@@ -577,6 +581,53 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Tracks whether any draw in the current frame used an async placeholder
+   // graphics pipeline and may have produced incomplete output.
+   bool frame_used_async_placeholder_pipeline_ = false;
++  // gow2-ps4 (v00.02): this frame's draws, those left out while their pipeline was being created
++  // (vulkan_pipeline_skip_pending), and the frames in a row not presented for that (vulkan_pipeline_hold_share).
++  uint32_t frame_issued_draws_ = 0;
++  uint32_t frame_pipeline_pending_draws_ = 0;
++  uint32_t frames_held_for_pipelines_in_a_row_ = 0;
++  // gow2-ps4 (v00.07): the repeat-draw shortcut (vulkan_repeat_draw_shortcut). In busy Gears of War 2 views three in
++  // four draws find the registers of the draw before them unchanged except the shader constants, the fetch constants
++  // and the draw's own registers, with the same shaders ([cp2]). What the last draw drawn computed from those inputs
++  // is kept here and taken again: its shader variants and translations, its pipeline and its viewport; and, when no
++  // fetch constant was written, in the same submission and with the texture cache's bindings unchanged
++  // (bindings_generation), its samplers and texture descriptor sets. Valid only after a draw that reached the draw
++  // command without memory export and with a final (not placeholder) pipeline.
++  struct RepeatDraw {
++    bool valid = false;
++    xenos::PrimitiveType prim_type = xenos::PrimitiveType::kNone;
++    const VulkanShader* pixel_shader = nullptr;  // the pixel shader after the analysis (null when not needed)
++    uint32_t interpolator_mask = 0;
++    uint32_t ps_param_gen_pos = UINT32_MAX;
++    uint32_t normalized_depth_control = 0;
++    Shader::HostVertexShaderType host_vertex_shader_type = Shader::HostVertexShaderType::kVertex;
++    SpirvShaderTranslator::Modification vertex_shader_modification;
++    SpirvShaderTranslator::Modification pixel_shader_modification;
++    VulkanShader::VulkanTranslation* vertex_shader_translation = nullptr;
++    VulkanShader::VulkanTranslation* pixel_shader_translation = nullptr;
++    // The pipeline's other inputs.
++    xenos::PrimitiveType guest_primitive_type = xenos::PrimitiveType::kNone;
++    xenos::PrimitiveType host_primitive_type = xenos::PrimitiveType::kNone;
++    xenos::TessellationMode tessellation_mode = xenos::TessellationMode::kDiscrete;
++    bool host_primitive_reset_enabled = false;
++    uint32_t normalized_color_mask = 0;
++    uint32_t render_pass_key = 0;
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider = nullptr;
++    void* pipeline_handle = nullptr;
++    draw_util::ViewportInfo viewport_info;
++    // The samplers (current_samplers_vertex_/pixel_) and texture sets.
++    uint64_t submission = 0;
++    uint64_t texture_generation = 0;
++    uint64_t texture_destructions = 0;
++  };
++  RepeatDraw repeat_draw_;
++  // The check (vulkan_repeat_draw_verify): the first repeat draws of a session, then 1 in 64, are worked out in full
++  // as well and compared with what the shortcut would have taken; a difference turns the shortcut off for the session.
++  uint64_t repeat_draws_seen_ = 0;
++  uint64_t repeat_draws_verified_ = 0;
++  bool repeat_draw_off_ = false;
++  std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> repeat_samplers_saved_[2];
+   // Guest frame index, since some transient resources can be reused across
+   // submissions. Values updated in the beginning of a frame.
+   uint64_t frame_current_ = 1;
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 7b938b9..ef067fa 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -92,7 +92,13 @@ class VulkanPipelineCache {
+       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
+-      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
++      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr,
++      bool* pending_out = nullptr);
++  // gow2-ps4 (v00.02): ConfigurePipeline returns false with *pending_out set for a draw whose pipeline the creation
++  // threads have not made yet (vulkan_pipeline_skip_pending): the draw is left out, nothing failed.
++  static bool SkipsPendingPipelines();
++  // Pipelines queued for the creation threads and not made yet (a gauge, for the stats line).
++  size_t QueuedCreationCount() const;
+   bool IsCreatingPipelines() const;
+   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
+                                     const PipelineLayoutProvider*& pipeline_layout_out,
+@@ -232,19 +238,29 @@ class VulkanPipelineCache {
+     PipelineDescription description;
+   });
+ 
++  // gow2-ps4 (v00.02): where a pipeline's creation stands when the command processor does not wait for it
++  // (vulkan_pipeline_skip_pending).
++  enum class CreationState : uint8_t {
++    kNone,     // created, or never queued
++    kQueued,   // queued for the creation threads (or being created): its draws are left out until it exists
++    kFailed,   // the creation failed: its draws fail as before
++  };
++
+   struct Pipeline {
+     std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};
+     // The layouts are owned by the VulkanCommandProcessor, and must not be
+     // destroyed by it while the pipeline cache is active.
+     std::atomic<const PipelineLayoutProvider*> pipeline_layout{nullptr};
+     std::atomic<bool> is_placeholder{false};
++    std::atomic<CreationState> creation_state{CreationState::kNone};
+     Pipeline() = default;
+     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
+         : pipeline_layout(pipeline_layout_provider) {}
+     Pipeline(const Pipeline& other)
+         : pipeline(other.pipeline.load(std::memory_order_acquire)),
+           pipeline_layout(other.pipeline_layout.load(std::memory_order_acquire)),
+-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {}
++          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
++          creation_state(other.creation_state.load(std::memory_order_acquire)) {}
+     Pipeline& operator=(const Pipeline& other) {
+       if (this == &other) {
+         return *this;
+@@ -254,6 +270,8 @@ class VulkanPipelineCache {
+                             std::memory_order_release);
+       is_placeholder.store(other.is_placeholder.load(std::memory_order_acquire),
+                            std::memory_order_release);
++      creation_state.store(other.creation_state.load(std::memory_order_acquire),
++                           std::memory_order_release);
+       return *this;
+     }
+   };
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 9c62e64..19eb585 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -47,6 +47,21 @@ REXCVAR_DEFINE_BOOL(vblank_at_gpu_wait, true, "GPU",
+                     "a refresh). Live")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++#if defined(__PS4__)
++// gow2-ps4 (v00.05): the guest's vblanks from the display's own (ps4-kit's wait_vblank on VideoOut's vblank events)
++// instead of the 60.00 Hz clock. With frames flipped at the vblank (no tearing), a clock that runs beside the TV's
++// 59.94 Hz drifts through its phase every ~33 s: for a few seconds of each cycle the game's frames finish right at a
++// refresh and show for 1, then 3 refreshes. Locked, a 30 fps game shows each frame for exactly two. Falls back to the
++// clock when VideoOut's vblank events can't be had, and with vblank_rate_scale above 1.
++REXCVAR_DEFINE_BOOL(vblank_from_display, false, "GPU",
++                    "PS4: the guest's vblank interrupt at each display vblank (VideoOut's events) instead of a 60 Hz "
++                    "clock. Restart")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++namespace ps4kit {
++bool wait_vblank(unsigned timeout_us);  // ps4-kit gpu/ps4_vk_wsi.cpp
++}  // namespace ps4kit
++#endif
++
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -183,16 +198,59 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+         // vig8-ps4 (vblank_at_gpu_wait): the coming vblank has fired already, brought forward to a GPU wait; its turn
+         // on the clock is skipped.
+         bool next_vblank_fired = false;
++        // vblank_from_display (PS4): a helper thread counts the display's vblanks and wakes this loop at each one.
++        std::atomic<uint64_t> display_vblanks{0};
++        std::atomic<bool> display_failed{false};
++        uint64_t display_seen = 0;
++        std::unique_ptr<rex::thread::Thread> display_thread;
++#if defined(__PS4__)
++        if (REXCVAR_GET(vblank_from_display) && vblank_scale == 1.0) {
++          display_thread = rex::thread::Thread::Create({}, [this, &display_vblanks, &display_failed]() {
++            while (vsync_worker_running_) {
++              if (!ps4kit::wait_vblank(500000)) {
++                display_failed.store(true, std::memory_order_release);
++                REXGPU_WARN("[vblank] no display vblank for 0.5 s: the guest's vblanks back on the 60 Hz clock");
++                break;
++              }
++              display_vblanks.fetch_add(1, std::memory_order_acq_rel);
++              vblank_wake_cv_.notify_all();
++            }
++          });
++          if (display_thread) {
++            display_thread->set_name("Display VBlank");
++            display_thread->set_priority(300);  // above the game's threads: it only wakes the loop below
++            REXGPU_INFO("[vblank] guest vblanks at the display's own (vblank_from_display)");
++          }
++        }
++#endif
++        const auto display_locked = [&] {
++          return display_thread && !display_failed.load(std::memory_order_acquire);
++        };
+         while (vsync_worker_running_) {
+           const bool vsync_on = REXCVAR_GET(vsync);
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks = vsync_on ? vsync_interval_ticks : no_vsync_interval_ticks;
+-          while (current_time - last_frame_time >= interval_ticks) {
+-            if (!next_vblank_fired) {
+-              MarkVblank();
++          const uint64_t display_count = display_vblanks.load(std::memory_order_acquire);
++          if (vsync_on && display_locked() && display_count) {
++            // One guest vblank per display vblank (a brought-forward one stands in for the next as on the clock).
++            if (!display_seen) display_seen = display_count - 1;
++            while (display_seen < display_count) {
++              if (!next_vblank_fired) {
++                MarkVblank();
++              }
++              next_vblank_fired = false;
++              ++display_seen;
+             }
+-            next_vblank_fired = false;
+-            last_frame_time += interval_ticks;
++            last_frame_time = current_time;  // the clock path in step, for a fallback
++          } else {
++            while (current_time - last_frame_time >= interval_ticks) {
++              if (!next_vblank_fired) {
++                MarkVblank();
++              }
++              next_vblank_fired = false;
++              last_frame_time += interval_ticks;
++            }
++            display_seen = display_count;
+           }
+           const bool can_bring_forward = vsync_on && !next_vblank_fired && REXCVAR_GET(vblank_at_gpu_wait);
+           if (can_bring_forward && early_vblank_requested_.exchange(false, std::memory_order_acq_rel)) {
+@@ -201,13 +259,17 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             cp_perf::Add(cp_perf::vblanks_early, 1);
+             continue;
+           }
+-          // Until the next vblank is due (1 ms steps, as before), or a GPU wait asks for it.
++          // Until the next vblank is due (1 ms steps, as before), a display vblank, or a GPU wait asks for it.
+           std::unique_lock<std::mutex> lock(vblank_wake_mutex_);
+           vblank_wake_cv_.wait_for(lock, std::chrono::milliseconds(1), [&] {
+             return !vsync_worker_running_ ||
++                   (display_locked() && display_vblanks.load(std::memory_order_acquire) != display_seen) ||
+                    (can_bring_forward && early_vblank_requested_.load(std::memory_order_acquire));
+           });
+         }
++        if (display_thread) {
++          rex::thread::Wait(display_thread.get(), false);  // it ends within 0.5 s; its counters live here
++        }
+         return 0;
+       }));
+   // TODO: set_can_debugger_suspend not yet ported
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 42ad818..8b9a128 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -288,6 +288,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
+     if (!destroyed_any) {
+       destroyed_any = true;
+       ++texture_destructions_;
++      ++bindings_generation_;  // gow2-ps4 (v00.07)
+       // The texture being destroyed might have been bound in the previous
+       // submissions, and nothing has overwritten the binding yet, so completion
+       // of the submission where the texture was last actually used on the GPU
+@@ -464,7 +465,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+     // A texture has become outdated - make sure whether textures are outdated
+     // is rechecked in this draw and in subsequent ones to reload the new data
+     // if needed.
+-    ResetTextureBindings();
++    ResetTextureBindings();  // (bumps bindings_generation_)
+   }
+ 
+   // Update the texture keys and the textures.
+@@ -608,6 +609,10 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+       }
+     }
+   }
++  // gow2-ps4 (v00.07): a changed binding or a (re)load may change what the draws' texture descriptors hold.
++  if (bindings_changed || !pending_texture_loads.empty()) {
++    ++bindings_generation_;
++  }
+   if (bindings_changed) {
+     UpdateTextureBindingsImpl(bindings_changed);
+   }
+@@ -778,6 +783,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
+ void TextureCache::DestroyAllTextures(bool from_destructor) {
+   ResetTextureBindings(from_destructor);
+   ++texture_destructions_;
++  ++bindings_generation_;  // gow2-ps4 (v00.07)
+   textures_.clear();
+   COUNT_profile_set("gpu/texture_cache/textures", 0);
+ }
+@@ -1024,6 +1030,7 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
+ }
+ 
+ void TextureCache::ResetTextureBindings(bool from_destructor) {
++  ++bindings_generation_;  // gow2-ps4 (v00.07)
+   uint32_t bindings_reset = 0;
+   for (size_t i = 0; i < texture_bindings_.size(); ++i) {
+     TextureBinding& binding = texture_bindings_[i];
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index faeb432..1a297fc 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -96,6 +96,13 @@ REXCVAR_DEFINE_STRING(gpu_debug_trace_address, "", "GPU", "Diagnostic: the textu
+ REXCVAR_DEFINE_INT32(gpu_debug_trace_frames, 1, "GPU", "Diagnostic: frames to trace");
+ REXCVAR_DEFINE_INT32(gpu_debug_census, 0, "GPU", "Diagnostic: frames of census (0 = none)");
+ REXCVAR_DEFINE_BOOL(gpu_debug_resdump, false, "GPU", "Diagnostic: dump one frame's resolves");
++// gow2-ps4 (v00.01): the vertex buffer in-sync bits are cleared at every swap so each buffer is requested again in a
++// new frame (the CPU may have rewritten it in place), but a buffer whose address and size equal the slot's last state
++// skipped the request anyway, so the first draw of a frame used the previous frame's data (the Gears of War 2 PC
++// port's SDK 0059, found by Flippage in the Gears of War 3 recompilation). true = the old skip.
++REXCVAR_DEFINE_BOOL(gpu_vertex_buffer_state_skip, false, "GPU",
++                    "Old behaviour: skip requesting a vertex buffer whose address and size match the last draw on "
++                    "that slot, even in a new frame (stale CPU-written data). Live");
+ 
+ REXCVAR_DEFINE_INT32(readback_resolve_max_kb, 0, "GPU",
+                      "Resolve readback only for resolves of up to this many KB (0 = every resolve)")
+@@ -497,6 +504,19 @@ void CpStatsOnSwap() {
+       double(st.queries) / f, double(st.memexports) / f, double(st.submissions) / f, double(st.waits) / f,
+       double(st.wait_ns) / 1e6 / f);
+   REXGPU_INFO("{}", text);
++  {
++    // gow2-ps4 (v00.02): what the pipelines still being created cost the picture (vulkan_pipeline_skip_pending):
++    // draws left out, frames not presented, the creation queue's largest size in the period.
++    namespace cpp = rex::graphics::cp_perf;
++    const uint64_t pending = cpp::pipeline_pending_draws.exchange(0, std::memory_order_relaxed);
++    const uint64_t held = cpp::frames_held_for_pipelines.exchange(0, std::memory_order_relaxed);
++    const uint64_t peak = cpp::pipeline_queue_peak.exchange(0, std::memory_order_relaxed);
++    if (pending || held || peak) {
++      REXGPU_INFO("[pipe] {} draws left out for their pipeline ({:.1f} a frame), {} frames not presented for that, "
++                  "creation queue up to {}",
++                  pending, double(pending) / f, held, peak);
++    }
++  }
+   {
+     // mp3-ps4 (v00.15): the command processor's time by part, as shares of the wall time since the last line
+     // (rex/graphics/cp_perf.h): the ring's packets (all of it), draws, submissions, the shared memory's lock waits,
+@@ -568,12 +588,14 @@ void CpStatsOnSwap() {
+       const std::string cp2 = fmt::format(
+           "[cp2] a frame: {:.1f} occlusion query events, {:.1f} visibility queries (both reported visible), {:.1f} "
+           "conditional draws (all drawn); {:.0f} draws found the state of the draw before them (only shader "
+-          "constants changed, same shaders), {:.0f} more with fetch constants changed too; sampler parameters "
++          "constants changed, same shaders), {:.0f} more with fetch constants changed too; repeat-draw shortcut "
++          "{:.0f} (texture sets kept in {:.0f}); sampler parameters "
+           "{:.0f} a frame, {:.0f} % from the memo; predicated tiling: {:.1f} screen extent events, {:.1f} "
+           "predicated packets left out; this period on core {}{}",
+           double(take(cpp::zpd_events)) / f, double(take(cpp::viz_queries)) / f,
+           double(take(cpp::conditional_draws)) / f, double(take(cpp::draws_same_state)) / f,
+-          double(take(cpp::draws_same_but_fetch)) / f, double(lookups) / f,
++          double(take(cpp::draws_same_but_fetch)) / f, double(take(cpp::repeat_draws)) / f,
++          double(take(cpp::repeat_texture_draws)) / f, double(lookups) / f,
+           lookups ? 100.0 * double(memo_hits) / double(lookups) : 0.0, double(take(cpp::extent_events)) / f,
+           double(take(cpp::predicated_skipped)) / f, rex::graphics::CommandProcessorCore(),
+           rex::graphics::CommandProcessorCoreCycling() ? " (gpu_commands_core_cycle: next period on the next core)"
+@@ -713,6 +735,13 @@ REX_GPU_DIAG void rex_gpu_set_swap_post_effect(int32_t effect) {
+   g_swap_post_effect_request.store(effect, std::memory_order_relaxed);
+ }
+ 
++// gow2-ps4 (v00.05): the guest draws of the last frame the command processor swapped, for the app's automatic profile
++// (a slow stretch with a few draws a frame is a movie or a loading screen, not the game's busy places).
++std::atomic<uint32_t> g_last_frame_draws{0};
++REX_GPU_DIAG uint32_t rex_gpu_last_frame_draws(void) {
++  return g_last_frame_draws.load(std::memory_order_relaxed);
++}
++
+ // The census (see above): start one for `frames` frames; the text once it is done ("" while it runs).
+ REX_GPU_DIAG void rex_gpu_census_start(uint32_t frames) {
+   {
+@@ -757,6 +786,16 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
+                     "When async shader compilation is enabled, skip presenting frames that "
+                     "used placeholder pipelines to avoid visible flashing")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++// gow2-ps4 (v00.02): with vulkan_pipeline_skip_pending a frame is presented with the draws whose pipeline is still
++// being created left out (an effect or object a few frames late), unless more than this share of its draws were left
++// out (a new area's first frames: most of the picture missing) - then the previous picture stays, at most 30 frames.
++// Not presenting every frame that used a placeholder (vulkan_async_skip_incomplete_frames) was one of v00.01's
++// freezes: the picture held for as long as any compile was in flight.
++REXCVAR_DEFINE_INT32(vulkan_pipeline_hold_share, 20, "GPU/Vulkan",
++                     "Percent of a frame's draws left out for their pipeline above which the frame is not "
++                     "presented (the previous picture stays); 100 = always present")
++    .range(1, 100)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_async_submit, true, "GPU/Vulkan",
+                     "Replay and submit the Vulkan command buffers on a thread of their own while the command processor "
+@@ -776,6 +815,15 @@ REXCVAR_DEFINE_BOOL(vulkan_async_swap, true, "GPU/Vulkan",
+ REXCVAR_DEFINE_BOOL(vulkan_texture_descriptor_set_reuse, true, "GPU/Vulkan",
+                     "A draw whose textures and samplers are the same as an earlier draw's in the frame binds the "
+                     "descriptor set written for that draw instead of writing a new one (mp3-ps4 v00.21)");
++REXCVAR_DEFINE_BOOL(vulkan_repeat_draw_shortcut, true, "GPU/Vulkan",
++                    "A draw with no register change since the draw before (only shader and fetch constants and its "
++                    "own draw registers) and the same shaders and primitive type takes that draw's shader variants, "
++                    "pipeline and viewport, and with no fetch constant written its samplers and texture sets too "
++                    "(gow2-ps4 v00.07). Live");
++REXCVAR_DEFINE_INT32(vulkan_repeat_draw_verify, 200000, "GPU/Vulkan",
++                     "vulkan_repeat_draw_shortcut's check: this many repeat draws at the start of a session, then 1 in "
++                     "64, are worked out in full as well and compared with what the shortcut would take; any difference "
++                     "is logged and turns the shortcut off for the session. 0: no check");
+ REXCVAR_DEFINE_INT32(vulkan_submit_every_draws, 256, "GPU/Vulkan",
+                      "With vulkan_async_submit: end the submission after this many draws (0 = only at the guest's "
+                      "primary buffer ends and swaps), so the submission thread replays the frame while it is recorded "
+@@ -3114,6 +3162,26 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+                                             frame_used_async_placeholder_pipeline_;
++  // gow2-ps4 (v00.02): a frame with too many draws left out for their pipelines (vulkan_pipeline_hold_share) keeps the
++  // previous picture, at most 30 frames in a row (a long creation queue must not freeze the screen).
++  g_last_frame_draws.store(frame_issued_draws_, std::memory_order_relaxed);
++  {
++    const uint64_t queued = pipeline_cache_->QueuedCreationCount();
++    uint64_t peak = cp_perf::pipeline_queue_peak.load(std::memory_order_relaxed);
++    if (queued > peak) {
++      cp_perf::pipeline_queue_peak.store(queued, std::memory_order_relaxed);
++    }
++    const uint32_t share = uint32_t(REXCVAR_GET(vulkan_pipeline_hold_share));
++    const bool too_incomplete = share < 100 && frame_pipeline_pending_draws_ > 4 &&
++                                uint64_t(frame_pipeline_pending_draws_) * 100 > uint64_t(frame_issued_draws_) * share;
++    if (too_incomplete && frames_held_for_pipelines_in_a_row_ < 30) {
++      ++frames_held_for_pipelines_in_a_row_;
++      cp_perf::Add(cp_perf::frames_held_for_pipelines, 1);
++      skip_present_due_async_placeholder = true;
++    } else {
++      frames_held_for_pipelines_in_a_row_ = 0;
++    }
++  }
+   if (skip_present_due_async_placeholder) {
+     static bool skipped_incomplete_frame_logged = false;
+     if (!skipped_incomplete_frame_logged) {
+@@ -4441,6 +4509,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
+   ++g_cp_stats.draws;
++  bool repeat_same_state = false, repeat_no_fetch = false;  // gow2-ps4 (v00.07)
+   {
+     // vig8-ps4 (v00.09): a draw that finds the state of the draw before it (only shader constants changed, same
+     // shaders) - what a shortcut for such draws could save ([cp2]).
+@@ -4448,12 +4517,36 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     const Shader* const ps_now = active_pixel_shader();
+     if (!state_changes_since_draw_ && vs_now == last_draw_shaders_[0] && ps_now == last_draw_shaders_[1]) {
+       cp_perf::Add(fetch_changed_since_draw_ ? cp_perf::draws_same_but_fetch : cp_perf::draws_same_state, 1);
++      repeat_same_state = true;
++      repeat_no_fetch = !fetch_changed_since_draw_;
+     }
+     last_draw_shaders_[0] = vs_now;
+     last_draw_shaders_[1] = ps_now;
+     state_changes_since_draw_ = 0;
+     fetch_changed_since_draw_ = false;
+   }
++  // gow2-ps4 (v00.07): the repeat-draw shortcut (repeat_draw_). Taken here and set again only by a draw that reaches
++  // its draw command: one that returns early (a copy, nothing to draw, a pipeline still being created, a failure)
++  // leaves it invalid, so the register changes before such a draw are never missed by the next one.
++  const bool repeat = repeat_same_state && repeat_draw_.valid && repeat_draw_.prim_type == prim_type &&
++                      !repeat_draw_off_ && REXCVAR_GET(vulkan_repeat_draw_shortcut);
++  repeat_draw_.valid = false;
++  // vulkan_repeat_draw_verify: this repeat draw is worked out in full too, and compared.
++  bool repeat_verify = false;
++  if (repeat) {
++    const int32_t verify_first = REXCVAR_GET(vulkan_repeat_draw_verify);
++    ++repeat_draws_seen_;
++    repeat_verify = verify_first > 0 && (repeat_draws_seen_ <= uint64_t(verify_first) || !(repeat_draws_seen_ & 63));
++  }
++  auto repeat_mismatch = [this](const char* part) {
++    if (!repeat_draw_off_) {
++      repeat_draw_off_ = true;
++      REXGPU_WARN(
++          "[repeat] {} differ from the draw before's at repeat draw {} ({} checked before it): the repeat-draw "
++          "shortcut is off for this session",
++          part, repeat_draws_seen_, repeat_draws_verified_);
++    }
++  };
+   const RegisterFile& regs = *register_file_;
+   (void)index_buffer_info;
+   auto draw_fail = [&](const char* stage) {
+@@ -4563,6 +4656,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   VulkanShader::VulkanTranslation* vertex_shader_translation;
+   VulkanShader::VulkanTranslation* pixel_shader_translation;
+   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
++  // gow2-ps4 (v00.07): which of the draw before's results this draw takes (repeat_draw_).
++  bool repeat_shaders = false, repeat_samplers = false;
+ 
+   // Two iterations because a submission (even the current one - in which case
+   // it needs to be ended, and a new one must be started) may need to be awaited
+@@ -4607,24 +4702,45 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+     // Shader modifications.
+     const uint64_t shaders_start = cp_perf::PartTicks();  // v00.22: to EnsureShadersTranslated (shaders_ticks)
+-    vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
+-        *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
+-        ps_param_gen_pos != UINT32_MAX);
+-    pixel_shader_modification = pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
+-                                                   *pixel_shader, interpolator_mask,
+-                                                   ps_param_gen_pos, normalized_depth_control)
+-                                             : SpirvShaderTranslator::Modification(0);
+-
+-    // Translate the shaders now to obtain the sampler bindings.
+-    vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+-        vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
+-    pixel_shader_translation =
+-        pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
+-                           pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
+-                     : nullptr;
+-    if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
+-                                                  pixel_shader_translation)) {
+-      return draw_fail("shader_translation");
++    // gow2-ps4 (v00.07): the same registers, shaders, primitive type, host vertex shader type, interpolators and depth
++    // control as the draw before: its modifications and (translated) translations.
++    repeat_shaders = repeat &&
++                     repeat_draw_.host_vertex_shader_type == primitive_processing_result.host_vertex_shader_type &&
++                     repeat_draw_.pixel_shader == pixel_shader && repeat_draw_.interpolator_mask == interpolator_mask &&
++                     repeat_draw_.ps_param_gen_pos == ps_param_gen_pos &&
++                     repeat_draw_.normalized_depth_control == normalized_depth_control.value;
++    if (repeat_shaders && !repeat_verify) {
++      vertex_shader_modification = repeat_draw_.vertex_shader_modification;
++      pixel_shader_modification = repeat_draw_.pixel_shader_modification;
++      vertex_shader_translation = repeat_draw_.vertex_shader_translation;
++      pixel_shader_translation = repeat_draw_.pixel_shader_translation;
++    } else {
++      vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
++          *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
++          ps_param_gen_pos != UINT32_MAX);
++      pixel_shader_modification = pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
++                                                     *pixel_shader, interpolator_mask,
++                                                     ps_param_gen_pos, normalized_depth_control)
++                                               : SpirvShaderTranslator::Modification(0);
++
++      // Translate the shaders now to obtain the sampler bindings.
++      vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
++          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
++      pixel_shader_translation =
++          pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
++                             pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
++                       : nullptr;
++      if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
++                                                    pixel_shader_translation)) {
++        return draw_fail("shader_translation");
++      }
++      if (repeat_shaders &&
++          (vertex_shader_modification.value != repeat_draw_.vertex_shader_modification.value ||
++           pixel_shader_modification.value != repeat_draw_.pixel_shader_modification.value ||
++           vertex_shader_translation != repeat_draw_.vertex_shader_translation ||
++           pixel_shader_translation != repeat_draw_.pixel_shader_translation)) {
++        repeat_mismatch("shader variants");
++      }
+     }
+     cp_perf::AddPart(cp_perf::shaders_ticks, shaders_start);
+ 
+@@ -4637,7 +4753,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     // submission.
+     uint32_t samplers_overflowed_count = 0;
+     const uint64_t samplers_start = cp_perf::PartTicks();  // v00.22 (samplers_ticks)
+-    for (uint32_t j = 0; j < 2; ++j) {
++    // gow2-ps4 (v00.07): no fetch constant written since the draw before (the sampler state is in the texture fetch
++    // constants), the same translations, the same submission (its samplers already marked as used in it):
++    // current_samplers_vertex_/pixel_ still hold this draw's samplers.
++    repeat_samplers = repeat_shaders && repeat_no_fetch && repeat_draw_.submission == GetCurrentSubmission();
++    if (repeat_samplers && repeat_verify && !i) {
++      repeat_samplers_saved_[0] = current_samplers_vertex_;
++      repeat_samplers_saved_[1] = current_samplers_pixel_;
++    }
++    for (uint32_t j = 0; j < (repeat_samplers && !repeat_verify ? 0u : 2u); ++j) {
+       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
+           j ? current_samplers_pixel_ : current_samplers_vertex_;
+       if (!i) {
+@@ -4681,6 +4805,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       }
+     }
+     cp_perf::AddPart(cp_perf::samplers_ticks, samplers_start);
++    if (repeat_samplers && repeat_verify && !samplers_overflowed_count) {
++      for (uint32_t j = 0; j < 2; ++j) {
++        const auto& now = j ? current_samplers_pixel_ : current_samplers_vertex_;
++        const auto& before = repeat_samplers_saved_[j];
++        bool same = now.size() == before.size();
++        for (size_t k = 0; same && k < now.size(); ++k) {
++          same = now[k].first == before[k].first && now[k].second == before[k].second;
++        }
++        if (!same) {
++          repeat_mismatch("samplers");
++        }
++      }
++    }
+     if (!samplers_overflowed_count) {
+       break;
+     }
+@@ -4725,24 +4862,56 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // textures.
+   VkPipeline pipeline;
+   void* pipeline_handle = nullptr;
+-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+-                                          primitive_processing_result, normalized_depth_control,
+-                                          normalized_color_mask,
+-                                          render_target_cache_->last_update_render_pass_key(),
+-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
+-    return draw_fail("configure_pipeline");
+-  }
++  bool pipeline_pending = false;
++  ++frame_issued_draws_;
++  // gow2-ps4 (v00.07): the pipeline's inputs besides the registers - the translations, the parts of the primitive
++  // processing result it reads (VulkanPipelineCache::GetCurrentStateDescription), the color mask and the render pass
++  // - as the draw before's: its pipeline (a final one: the cache is only set with no placeholder).
++  const uint32_t render_pass_key = render_target_cache_->last_update_render_pass_key().key;
++  const bool repeat_pipeline =
++      repeat_shaders && repeat_draw_.render_pass_key == render_pass_key &&
++      repeat_draw_.normalized_color_mask == normalized_color_mask &&
++      repeat_draw_.guest_primitive_type == primitive_processing_result.guest_primitive_type &&
++      repeat_draw_.host_primitive_type == primitive_processing_result.host_primitive_type &&
++      repeat_draw_.tessellation_mode == primitive_processing_result.tessellation_mode &&
++      repeat_draw_.host_primitive_reset_enabled == primitive_processing_result.host_primitive_reset_enabled;
+   bool pipeline_is_placeholder = false;
+-  // Reload the current handle state to observe async hot-swap completions that
+-  // may happen between pipeline configuration and binding.
+-  pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
+-                                                &pipeline_is_placeholder);
+-  if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
+-    frame_used_async_placeholder_pipeline_ = true;
+-    return true;
+-  }
+-  if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
+-    return draw_fail("pipeline_lookup");
++  if (repeat_pipeline && !repeat_verify) {
++    pipeline = repeat_draw_.pipeline;
++    pipeline_layout_provider = repeat_draw_.pipeline_layout_provider;
++    pipeline_handle = repeat_draw_.pipeline_handle;
++  } else {
++    if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
++                                            primitive_processing_result, normalized_depth_control,
++                                            normalized_color_mask,
++                                            render_target_cache_->last_update_render_pass_key(),
++                                            pipeline, pipeline_layout_provider, &pipeline_handle,
++                                            &pipeline_pending)) {
++      if (pipeline_pending) {
++        // gow2-ps4 (v00.02): its pipeline is still with the creation threads (vulkan_pipeline_skip_pending): this
++        // draw is left out (as the placeholder path below returns), it comes back once the pipeline exists.
++        ++frame_pipeline_pending_draws_;
++        cp_perf::Add(cp_perf::pipeline_pending_draws, 1);
++        return true;
++      }
++      return draw_fail("configure_pipeline");
++    }
++    // Reload the current handle state to observe async hot-swap completions that
++    // may happen between pipeline configuration and binding.
++    pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
++                                                  &pipeline_is_placeholder);
++    if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
++      frame_used_async_placeholder_pipeline_ = true;
++      return true;
++    }
++    if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
++      return draw_fail("pipeline_lookup");
++    }
++    if (repeat_pipeline &&
++        (pipeline != repeat_draw_.pipeline || pipeline_layout_provider != repeat_draw_.pipeline_layout_provider ||
++         pipeline_handle != repeat_draw_.pipeline_handle)) {
++      repeat_mismatch("pipelines");
++    }
+   }
+   if (current_guest_graphics_pipeline_ != pipeline) {
+     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+@@ -4806,12 +4975,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // directly to pixel address and to things like ps_param_gen.
+   {
+     cp_perf::ScopePartTicks viewport_time(cp_perf::viewport_ticks);  // v00.22
+-    draw_util::GetHostViewportInfo(
+-        regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
+-        device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
+-        normalized_depth_control,
+-        host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
+-        host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
++    if (repeat_shaders && !repeat_verify) {
++      // gow2-ps4 (v00.07): its inputs (the registers, the depth control, the pixel shader's depth writes, the
++      // resolution scale) are the draw before's.
++      viewport_info = repeat_draw_.viewport_info;
++    } else {
++      draw_util::GetHostViewportInfo(
++          regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
++          device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
++          normalized_depth_control,
++          host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
++          host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
++      // (four-byte fields only: no padding)
++      if (repeat_shaders && std::memcmp(&viewport_info, &repeat_draw_.viewport_info, sizeof(viewport_info))) {
++        repeat_mismatch("viewports");
++      }
++    }
+   }
+ 
+   // Update dynamic graphics pipeline state.
+@@ -4855,9 +5034,30 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   // Update uniform buffers and descriptor sets after binding the pipeline with
+   // the new layout.
+-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
++  // gow2-ps4 (v00.07): the draw before's texture sets when its samplers were kept and the texture cache's bindings
++  // have not changed since (RequestTextures above bumps bindings_generation for any change or load).
++  const bool keep_texture_sets = repeat_samplers && repeat_pipeline &&
++                                 repeat_draw_.texture_generation == texture_cache_->bindings_generation() &&
++                                 repeat_draw_.texture_destructions == texture_cache_->texture_destructions();
++  const VkDescriptorSet texture_sets_before[2] = {
++      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex],
++      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel]};
++  if (!UpdateBindings(vertex_shader, pixel_shader, keep_texture_sets && !repeat_verify)) {
+     return draw_fail("update_bindings");
+   }
++  // The check: worked out in full, a stage with textures or samplers must have found the very set it had (with
++  // vulkan_texture_descriptor_set_reuse, a set with the same contents is found again rather than written anew).
++  if (keep_texture_sets && repeat_verify && REXCVAR_GET(vulkan_texture_descriptor_set_reuse)) {
++    for (uint32_t j = 0; j < 2; ++j) {
++      const VulkanShader* stage = j ? pixel_shader : vertex_shader;
++      if (stage && (!stage->GetTextureBindingsAfterTranslation().empty() ||
++                    !stage->GetSamplerBindingsAfterTranslation().empty()) &&
++          current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex + j] !=
++              texture_sets_before[j]) {
++        repeat_mismatch("texture sets");
++      }
++    }
++  }
+ 
+   // Ensure vertex buffers are resident.
+   const uint64_t vertex_start = cp_perf::PartTicks();  // v00.22: to the memexport ranges (vertex_ticks)
+@@ -4893,7 +5093,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+           return false;
+       }
+       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
+-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
++      // gow2-ps4: requested again in every frame (gpu_vertex_buffer_state_skip above).
++      if (REXCVAR_GET(gpu_vertex_buffer_state_skip) && state.address == vfetch_constant.address &&
++          state.size == vfetch_constant.size) {
+         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+         continue;
+       }
+@@ -5045,6 +5247,52 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     cp_perf::Add(cp_perf::record_ticks, (record_mid - record_start) + (cp_perf::Ticks() - record_resume));
+   }
+ 
++  // gow2-ps4 (v00.07): what this draw computed, for a repeat of it (repeat_draw_) - not with memory export (its ranges
++  // come from the float constants) and not with a placeholder pipeline.
++  if (repeat_pipeline && !repeat_verify) {
++    cp_perf::Add(cp_perf::repeat_draws, 1);
++    if (keep_texture_sets) {
++      cp_perf::Add(cp_perf::repeat_texture_draws, 1);
++    }
++  }
++  if (repeat_verify && !repeat_draw_off_) {
++    ++repeat_draws_verified_;
++    const int32_t verify_first = REXCVAR_GET(vulkan_repeat_draw_verify);
++    if (verify_first > 0 && repeat_draws_verified_ == uint64_t(verify_first)) {
++      REXGPU_INFO(
++          "[repeat] the first {} repeat draws matched the full work: the repeat-draw shortcut takes them from here "
++          "(1 in 64 still checked)",
++          verify_first);
++    }
++  }
++  if (!memexport_writes_possible && !pipeline_is_placeholder) {
++    RepeatDraw& rd = repeat_draw_;
++    rd.prim_type = prim_type;
++    rd.pixel_shader = pixel_shader;
++    rd.interpolator_mask = interpolator_mask;
++    rd.ps_param_gen_pos = ps_param_gen_pos;
++    rd.normalized_depth_control = normalized_depth_control.value;
++    rd.host_vertex_shader_type = primitive_processing_result.host_vertex_shader_type;
++    rd.vertex_shader_modification = vertex_shader_modification;
++    rd.pixel_shader_modification = pixel_shader_modification;
++    rd.vertex_shader_translation = vertex_shader_translation;
++    rd.pixel_shader_translation = pixel_shader_translation;
++    rd.guest_primitive_type = primitive_processing_result.guest_primitive_type;
++    rd.host_primitive_type = primitive_processing_result.host_primitive_type;
++    rd.tessellation_mode = primitive_processing_result.tessellation_mode;
++    rd.host_primitive_reset_enabled = primitive_processing_result.host_primitive_reset_enabled;
++    rd.normalized_color_mask = normalized_color_mask;
++    rd.render_pass_key = render_pass_key;
++    rd.pipeline = pipeline;
++    rd.pipeline_layout_provider = pipeline_layout_provider;
++    rd.pipeline_handle = pipeline_handle;
++    rd.viewport_info = viewport_info;
++    rd.submission = GetCurrentSubmission();
++    rd.texture_generation = texture_cache_->bindings_generation();
++    rd.texture_destructions = texture_cache_->texture_destructions();
++    rd.valid = true;
++  }
++
+   // Invalidate textures in memexported memory and watch for changes.
+   if (!memexport_ranges_.empty()) {
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+@@ -6018,7 +6266,11 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+ }
+ 
+ bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
+-  return !submission_open_ || (!scratch_buffer_used_ && !pipeline_cache_->IsCreatingPipelines());
++  // gow2-ps4 (v00.02): with vulkan_pipeline_skip_pending, EndSubmission no longer waits for pipeline creation, so
++  // pipelines being created in the background do not hold the partial submissions back.
++  return !submission_open_ ||
++         (!scratch_buffer_used_ &&
++          (VulkanPipelineCache::SkipsPendingPipelines() || !pipeline_cache_->IsCreatingPipelines()));
+ }
+ 
+ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -6095,6 +6347,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+   if (is_opening_frame) {
+     frame_open_ = true;
+     frame_used_async_placeholder_pipeline_ = false;
++    frame_issued_draws_ = 0;
++    frame_pipeline_pending_draws_ = 0;
+ 
+     // Reset bindings that depend on transient data.
+     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
+@@ -7557,7 +7811,7 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+ }
+ 
+ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+-                                            const VulkanShader* pixel_shader) {
++                                            const VulkanShader* pixel_shader, bool keep_texture_sets) {
+   cp_perf::ScopePartTicks cp_perf_time(cp_perf::bind_ticks);  // vig8-ps4 (v00.09): sampled
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+@@ -7776,9 +8030,15 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+   const VkDescriptorSet texture_sets_before[2] = {
+       current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex],
+       current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel]};
+-  current_graphics_descriptor_set_values_up_to_date_ &=
+-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
++  // gow2-ps4 (v00.07): keep_texture_sets - the sets the draw before wrote or found stay valid for this draw (same
++  // shaders, samplers, fetch constants and texture bindings), so their up-to-date bits stay set and everything below
++  // that builds, looks up or writes texture sets skips itself (write_*_textures come out false); a set that is not
++  // bound any more is still bound by the loop at the end.
++  if (!keep_texture_sets) {
++    current_graphics_descriptor_set_values_up_to_date_ &=
++        ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
++          (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
++  }
+ 
+   // Make sure new descriptor sets are bound to the command buffer.
+ 
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index ecd8e54..2f95345 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -60,6 +60,27 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// gow2-ps4 (v00.02): Gears of War 2 v00.01 hitched for 100-800 ms whenever new pipelines came up (a 6-minute clip:
++// ~150 freezes in moving scenes, each in a stretch of the log with pipeline creations). Every new pipeline cost the
++// command processor a placeholder (the vertex shader plus a stand-in pixel shader) compiled on its own thread, ~20 ms
++// of RADV's compiler on the Jaguar; draws without a pixel shader were compiled there outright; EndSubmission compiled
++// every queued pipeline itself and waited for the creation threads; and the frames that used a placeholder were not
++// presented at all. With this on, a new pipeline only goes to the creation threads: its draws are left out until it
++// exists (a few frames: the object appears a moment late), the command processor never compiles or waits.
++REXCVAR_DEFINE_BOOL(vulkan_pipeline_skip_pending, true, "GPU/Vulkan",
++                    "Leave out the draws whose pipeline is still being created (by the creation threads) instead of "
++                    "the command processor creating it and waiting: no hitch when new shaders come up, the object "
++                    "shows a few frames late. Restart")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++// The creation threads below the game's threads (the PS4 runs equal priorities without time slices: at the game
++// threads' level a 20 ms compile held the render thread off its core). PS4 priorities: 256 highest .. 767 lowest;
++// the game's threads are 640-760, the SDK's service threads 600.
++REXCVAR_DEFINE_INT32(vulkan_pipeline_creation_priority, 767, "GPU/Vulkan",
++                     "The pipeline creation threads' priority on the PS4 (256 highest .. 767 lowest; 0 = the "
++                     "default)")
++    .range(0, 767)
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+@@ -390,8 +411,17 @@ bool VulkanPipelineCache::Initialize() {
+           rex::thread::Thread::Create({}, [this, i]() { CreationThread(i); });
+       assert_not_null(creation_thread);
+       creation_thread->set_name("Vulkan Pipelines");
++#if defined(__PS4__)
++      // gow2-ps4 (v00.02): below the game's threads (vulkan_pipeline_creation_priority).
++      if (REXCVAR_GET(vulkan_pipeline_creation_priority) >= 256) {
++        creation_thread->set_priority(REXCVAR_GET(vulkan_pipeline_creation_priority));
++      }
++#endif
+       creation_threads_.push_back(std::move(creation_thread));
+     }
++    REXGPU_INFO("VulkanPipelineCache: {} pipeline creation threads (priority {}); draws wait for their pipeline: {}",
++                creation_thread_count, REXCVAR_GET(vulkan_pipeline_creation_priority),
++                REXCVAR_GET(vulkan_pipeline_skip_pending) ? "no (left out until it exists)" : "yes");
+   }
+ 
+   return true;
+@@ -774,8 +804,10 @@ void VulkanPipelineCache::EndSubmission() {
+       std::lock_guard<std::mutex> lock(creation_request_lock_);
+       startup_loading = startup_loading_;
+     }
+-    if (startup_loading) {
+-      creation_request_cond_.notify_one();
++    if (startup_loading || SkipsPendingPipelines()) {
++      // gow2-ps4 (v00.02): with vulkan_pipeline_skip_pending the queued pipelines stay with the creation threads
++      // (their draws are left out until they exist): the command processor neither creates them nor waits here.
++      creation_request_cond_.notify_all();
+     } else {
+       // Help worker threads on the processor thread to reduce warm-up latency.
+       CreateQueuedPipelinesOnProcessorThread();
+@@ -1061,8 +1093,12 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+     VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
+-    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out) {
++    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out,
++    bool* pending_out) {
+   cp_perf::ScopePartTicks cp_perf_time(cp_perf::pipe_ticks);  // vig8-ps4 (v00.09): sampled
++  if (pending_out) {
++    *pending_out = false;
++  }
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -1123,9 +1159,32 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     }
+   }
+ 
+-  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
++  // gow2-ps4 (v00.02): vulkan_pipeline_skip_pending - new pipelines only go to the creation threads, their draws are
++  // left out until they exist (no placeholder, no creation on this thread).
++  const bool skip_pending = SkipsPendingPipelines() && !creation_threads_.empty();
++  bool use_async = !skip_pending && REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
+                    pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE;
+   uint8_t async_priority = pipeline_util::kPriorityLowest;
++  if (skip_pending) {
++    // Depth-only draws (no pixel shader) are queued too; their priority from the depth writes.
++    async_priority = pipeline_util::CalculatePipelinePriority(
++        pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask),
++        pixel_shader ? pixel_shader->shader().writes_color_targets() : 0,
++        pixel_shader ? pixel_shader->shader().writes_depth() : normalized_depth_control.z_write_enable != 0);
++  }
++  // Hands a pipeline to the creation threads; its draws are pending until one of them has made it.
++  auto queue_creation = [this, pending_out](PipelineCreationArguments& creation_arguments, uint8_t priority) {
++    creation_arguments.priority = priority;
++    creation_arguments.pipeline->second.creation_state.store(CreationState::kQueued, std::memory_order_release);
++    {
++      std::lock_guard<std::mutex> lock(creation_request_lock_);
++      creation_queue_.push(creation_arguments);
++    }
++    creation_request_cond_.notify_one();
++    if (pending_out) {
++      *pending_out = true;
++    }
++  };
+   if (use_async) {
+     uint32_t bound_rts =
+         pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask);
+@@ -1140,6 +1199,30 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   auto it = pipelines_.find(description);
+   if (it != pipelines_.end()) {
+     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
++    if (found_pipeline == VK_NULL_HANDLE && skip_pending) {
++      // gow2-ps4 (v00.02): still with the creation threads - this draw is left out.
++      const CreationState state = it->second.creation_state.load(std::memory_order_acquire);
++      if (state == CreationState::kQueued) {
++        if (pending_out) {
++          *pending_out = true;
++        }
++        return false;
++      }
++      if (state == CreationState::kFailed) {
++        return false;
++      }
++      // A thread may have finished it between the two loads.
++      found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
++      if (found_pipeline == VK_NULL_HANDLE) {
++        // Never queued (a stored one whose creation failed at startup, or one from before the switch).
++        PipelineCreationArguments creation_arguments;
++        if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments)) {
++          return false;
++        }
++        queue_creation(creation_arguments, async_priority);
++        return false;
++      }
++    }
+     if (found_pipeline == VK_NULL_HANDLE) {
+       PipelineCreationArguments creation_arguments;
+       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
+@@ -1168,6 +1251,24 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     return false;
+   }
+ 
++  // gow2-ps4 (v00.02): only queued; recorded in the storage file now, so the next start creates it up front.
++  if (skip_pending) {
++    queue_creation(creation_arguments_real, async_priority);
++    if (pipeline_storage_file_) {
++      assert_not_null(storage_write_thread_);
++      pipeline_storage_file_flush_needed_ = true;
++      {
++        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
++        storage_write_pipeline_queue_.emplace_back();
++        PipelineStoredDescription& stored_description = storage_write_pipeline_queue_.back();
++        stored_description.description_hash = description.GetHash();
++        std::memcpy(&stored_description.description, &description, sizeof(description));
++      }
++      storage_write_request_cond_.notify_all();
++    }
++    return false;
++  }
++
+   bool queued_async_creation = false;
+   if (use_async) {
+     creation_arguments_real.priority = async_priority;
+@@ -3564,6 +3665,9 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
+                                                            std::memory_order_release);
+       }
+     }
++    // gow2-ps4 (v00.02): after the pipeline itself (ConfigurePipeline reads the state, then the pipeline again).
++    creation_arguments.pipeline->second.creation_state.store(
++        created ? CreationState::kNone : CreationState::kFailed, std::memory_order_release);
+ 
+     {
+       std::lock_guard<std::mutex> lock(creation_request_lock_);
+@@ -3572,6 +3676,17 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
+   }
+ }
+ 
++bool VulkanPipelineCache::SkipsPendingPipelines() {
++  // Read once: switching while pipelines are queued would have this thread create one the threads also hold.
++  static const bool skip = REXCVAR_GET(vulkan_pipeline_skip_pending);
++  return skip;
++}
++
++size_t VulkanPipelineCache::QueuedCreationCount() const {
++  std::lock_guard<std::mutex> lock(creation_request_lock_);
++  return creation_queue_.size() + creation_threads_busy_;
++}
++
+ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
+   assert_false(creation_threads_.empty());
+   while (true) {
+@@ -3597,6 +3712,8 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
+                                                            std::memory_order_release);
+       }
+     }
++    creation_arguments.pipeline->second.creation_state.store(
++        created ? CreationState::kNone : CreationState::kFailed, std::memory_order_release);
+   }
+ }
+ 
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index eae7392..6338648 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -343,7 +343,9 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
+   switch (usage) {
+     case Usage::kComputeWrite:
+       stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+-      access_mask = VK_ACCESS_SHADER_READ_BIT;
++      // Resolves write guest memory from compute: without the write bit the barrier before a later read did not
++      // cover those writes (D3D12 issues a UAV barrier there). The Gears of War 2 PC port's SDK patch 0020.
++      access_mask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+       return;
+     case Usage::kTransferDestination:
+       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
